@@ -1,0 +1,39 @@
+{
+
+    "host": "127.0.0.1",
+    "port": 8000,
+    "tick": 0.2,
+
+    "carla": {
+        "host": "127.0.0.1",
+        "port": 2000,
+        "timeout": 10.0
+    },
+
+    "sensors": [
+        {
+            "type": "sensor.camera.rgb",
+            "attributes": {
+                "image_size_x": 800,
+                "image_size_y": 600,
+                "fov": 90
+            },
+            "transform": {
+                "position": [6.3, -6.3, 7.8],
+                "rotation": [-19.0, 134.8, 0.0]
+            }
+        },
+        {
+            "type": "sensor.lidar.ray_cast",
+            "attributes": {
+                "range": 500,
+                "channels": 32,
+                "horizontal_fov": 360
+            },
+            "transform": {
+                "position": [-5.85, -5.85, 2.17],
+                "rotation": [-10.30, 46.16, 0.0]
+            }
+        }
+    ]
+}
