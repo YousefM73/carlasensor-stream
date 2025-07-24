@@ -88,24 +88,34 @@ class LIDAR_RAY_CAST:
     def process_data(self):
         if not self.data_queue:
             return
-            
+        
         raw_data = self.data_queue.pop()
         self.data_queue.clear()
         
         data = np.copy(np.frombuffer(raw_data, dtype=np.dtype('f4')))
         data = np.reshape(data, (int(data.shape[0] / 4), 4))
 
-        intensity = data[:, -1]
-        intensity_col = 1.0 - np.log(intensity) / np.log(np.exp(-0.004 * 100))
-        int_color = np.c_[np.interp(intensity_col, VID_RANGE, VIRIDIS[:, 0]),
-                          np.interp(intensity_col, VID_RANGE, VIRIDIS[:, 1]),
-                          np.interp(intensity_col, VID_RANGE, VIRIDIS[:, 2])]
-
         points = data[:, :-1]
         points[:, :1] = -points[:, :1]
+        
+        height = points[:, 2]
+
+        if len(height) > 0:
+            height_min = np.min(height)
+            height_max = np.max(height)
+            if height_max > height_min:
+                height_normalized = (height - height_min) / (height_max - height_min)
+            else:
+                height_normalized = np.zeros_like(height)
+        else:
+            height_normalized = np.array([])
+        
+        height_color = np.c_[np.interp(height_normalized, VID_RANGE, VIRIDIS[:, 0]),
+                            np.interp(height_normalized, VID_RANGE, VIRIDIS[:, 1]),
+                            np.interp(height_normalized, VID_RANGE, VIRIDIS[:, 2])]
 
         self.point_list.points = o3d.utility.Vector3dVector(points)
-        self.point_list.colors = o3d.utility.Vector3dVector(int_color)
+        self.point_list.colors = o3d.utility.Vector3dVector(height_color)
 
         if not self.geometry_added:
             self.vis.add_geometry(self.point_list)
