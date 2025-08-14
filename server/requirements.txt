@@ -1,4 +1,5 @@
-opencv-python
-numpy
-open3d
-matplotlib
+carla
+opencv-python>=4.5.0
+numpy>=1.19.0
+open3d>=0.13.0
+matplotlib>=3.3.0

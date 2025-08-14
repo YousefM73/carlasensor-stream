@@ -3,15 +3,12 @@ import asyncio
 import json
 import threading
 import struct
-import time
-import uuid  # Add this import at the top
-
-import cv2
+import carla
+import uuid
 import numpy as np
-import open3d as o3d
-from matplotlib import cm # pylint: disable=import-error
 
-global client, config
+global server, config
+global sensors
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, 'config.json')
@@ -19,220 +16,162 @@ config_path = os.path.join(script_dir, 'config.json')
 with open(config_path, 'r') as f:
     config = json.load(f)
 
-windows = {}
+cache = []
+sensors = {}
 
-VIRIDIS = np.array(cm.get_cmap('plasma').colors)
-VID_RANGE = np.linspace(0.0, 1.0, VIRIDIS.shape[0])
+current_frame = 0
+current_data = {}
 
-class CAMERA_RGB:
-    def __init__(self, id, width, height):
-        self.id = id
-        self.image_queue = []
-        self.width = width
-        self.height = height
-        self.last_data_time = time.time()
-        windows[id] = self
+def push_data():
+    global cache, current_data, current_frame
+    if current_data:
+        current_data['frame'] = current_frame
+        cache.insert(0, current_data.copy())
+        current_data.clear()
+    if len(cache) > 60:
+        cache.pop()
 
-    def display(self, data):
-        self.last_data_time = time.time()
-        array = np.frombuffer(data, dtype=np.dtype("uint8"))
-        array = np.reshape(array, (self.height, self.width, 3))
-        self.image_queue.append(array)
+class CARLASensor:
+    def __init__(self, configuration, world):
+        self.configuration = configuration
 
-    def tick(self):
-        if time.time() - self.last_data_time > 3.0:
-            print(f"Window {self.id} timed out, closing...")
-            self.destroy()
-            return False
+        self.id = uuid.uuid4()
+        self.data = None
+
+        blueprint = world.get_blueprint_library().find(configuration['type'])
+        for key, value in configuration['attributes'].items():
+            blueprint.set_attribute(key, str(value))
+
+        position = carla.Location(x=configuration['transform']['position'][0], y=configuration['transform']['position'][1], z=configuration['transform']['position'][2])
+        rotation = carla.Rotation(pitch=configuration['transform']['rotation'][0], yaw=configuration['transform']['rotation'][1], roll=configuration['transform']['rotation'][2])
+        transform = carla.Transform(position, rotation)
+
+        self.sensor = world.spawn_actor(blueprint, transform)
+        self.sensor.listen(self.update)
+        sensors[str(self.id)] = self
+
+    def update(self, output):
+        global current_frame, current_data
+        
+        if current_frame != output.frame:
+            push_data()
+            current_frame = output.frame
+
+        if self.configuration["type"] == "sensor.camera.rgb":
+            image_array = np.frombuffer(output.raw_data, dtype=np.uint8)
+            image_array = image_array.reshape((output.height, output.width, 4))
+            rgb_array = image_array[:, :, :3]
+            self.data = rgb_array.tobytes()
             
-        if self.image_queue:
-            img = self.image_queue.pop(0)
-            cv2.imshow(self.id, img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.destroy()
-                return False
-        
-        return True
-
-    def destroy(self):
-        cv2.destroyWindow(self.id)
-        windows.pop(self.id, None)
-
-class LIDAR_RAY_CAST:
-    def __init__(self, id):
-        self.id = id
-        self.point_list = o3d.geometry.PointCloud()
-        self.vis = None
-        self.geometry_added = False
-        self.last_data_time = time.time()
-        self.data_queue = []
-        self.needs_update = False
-        windows[id] = self
-
-    def initialize_visualization(self):
-        if self.vis is None:
-            self.vis = o3d.visualization.Visualizer()
-            self.vis.create_window(
-                window_name=self.id,
-                width=1280,
-                height=720)
-            
-            self.vis.get_render_option().background_color = [0.05, 0.05, 0.05]
-            self.vis.get_render_option().point_size = 2
-
-    def display(self, raw_data):
-        self.last_data_time = time.time()
-        self.data_queue.append(raw_data)
-        self.needs_update = True
-
-    def process_data(self):
-        if not self.data_queue:
-            return
-        
-        raw_data = self.data_queue.pop()
-        self.data_queue.clear()
-        
-        data = np.copy(np.frombuffer(raw_data, dtype=np.dtype('f4')))
-        data = np.reshape(data, (int(data.shape[0] / 4), 4))
-
-        points = data[:, :-1]
-        points[:, :1] = -points[:, :1]
-        
-        height = points[:, 2]
-
-        if len(height) > 0:
-            height_min = np.min(height)
-            height_max = np.max(height)
-            if height_max > height_min:
-                height_normalized = (height - height_min) / (height_max - height_min)
-            else:
-                height_normalized = np.zeros_like(height)
+            current_data[str(self.id)] = {
+                'type': self.configuration['type'],
+                'data': self.data,
+                'metadata': {
+                    'width': output.width if hasattr(output, 'width') else 0,
+                    'height': output.height if hasattr(output, 'height') else 0
+                }
+            }
         else:
-            height_normalized = np.array([])
-        
-        height_color = np.c_[np.interp(height_normalized, VID_RANGE, VIRIDIS[:, 0]),
-                            np.interp(height_normalized, VID_RANGE, VIRIDIS[:, 1]),
-                            np.interp(height_normalized, VID_RANGE, VIRIDIS[:, 2])]
-
-        self.point_list.points = o3d.utility.Vector3dVector(points)
-        self.point_list.colors = o3d.utility.Vector3dVector(height_color)
-
-        if not self.geometry_added:
-            self.vis.add_geometry(self.point_list)
-            self.geometry_added = True
-        
-        self.needs_update = True
-
-    def tick(self):
-        if time.time() - self.last_data_time > 3.0:
-            print(f"Window {self.id} timed out, closing...")
-            self.destroy()
-            return False
-        
-        if self.vis is None:
-            self.initialize_visualization()
-        
-        self.process_data()
-        
-        if self.needs_update and self.geometry_added:
-            self.vis.update_geometry(self.point_list)
-            self.needs_update = False
-        
-        should_continue = self.vis.poll_events()
-        self.vis.update_renderer()
-        
-        return should_continue
+            self.data = output.raw_data
+            
+            current_data[str(self.id)] = {
+                'type': self.configuration['type'],
+                'data': self.data,
+            }
 
     def destroy(self):
-        windows.pop(self.id, None)
-        if self.vis is not None:
-            self.vis.destroy_window()
+        sensors[str(self.id)] = None
+        self.sensor.destroy()
 
-def update_visualizations():
-    windows_to_remove = []
-    for window_id, win in list(windows.items()):
-        try:
-            if not win.tick():
-                windows_to_remove.append(window_id)
-        except Exception as e:
-            print(f"Error updating window {window_id}: {e}")
-            windows_to_remove.append(window_id)
-    
-    for window_id in windows_to_remove:
-        if window_id in windows:
-            windows[window_id].destroy()
+def open_carla():
+    try:
+        client = carla.Client(config['carla']['host'], config['carla']['port'])
+        client.set_timeout(config['carla']['timeout'])
+        
+        return client
+    except Exception as e:
+        print(f"Error connecting to CARLA: {e}")
+        return None
 
 async def handle_data(reader, writer):
     try:
         while True:
-            batch_header_data = await reader.readexactly(8)
-            if len(batch_header_data) < 8:
-                print("Incomplete batch header received")
+            try:
+                data = await reader.readexactly(4)
+                start_frame = struct.unpack('I', data)[0]
+
+                print(f"Received request from {writer.get_extra_info('peername')} for data beginning frame {start_frame}.")
+                
+                batch_data = [frame for frame in cache if 'frame' in frame and frame['frame'] >= start_frame]
+                batch_data.sort(key=lambda x: x['frame'])
+                
+                main_header = struct.pack('I', len(batch_data))
+                writer.write(main_header)
+
+                for frame_data in batch_data:
+                    frame_header = struct.pack('QI', frame_data['frame'], len(frame_data) - 1)
+                    writer.write(frame_header)
+                    
+                    for sensor_id, sensor_info in frame_data.items():
+                        if sensor_id == 'frame':
+                            continue
+                        
+                        sensor_type = sensor_info['type'].encode()[:32].ljust(32, b'\x00')
+                        data_length = len(sensor_info['data'])
+                        
+                        has_metadata = 'metadata' in sensor_info
+                        metadata_flag = 1 if has_metadata else 0
+                        
+                        sensor_header = struct.pack('16s32sII', 
+                            uuid.UUID(sensor_id).bytes,
+                            sensor_type,
+                            data_length,
+                            metadata_flag
+                        )
+                        writer.write(sensor_header)
+                        
+                        if has_metadata:
+                            metadata = sensor_info['metadata']
+                            width = metadata.get('width', 0)
+                            height = metadata.get('height', 0)
+                            metadata_data = struct.pack('II', width, height)
+                            writer.write(metadata_data)
+                        
+                        writer.write(sensor_info['data'])
+                
+                await writer.drain()
+                
+            except asyncio.IncompleteReadError:
+                print("Client disconnected")
+                break
+            except ConnectionResetError:
+                print("Connection reset by client")
                 break
                 
-            sensor_count, total_size = struct.unpack('II', batch_header_data)
-            print(f"Batch: {sensor_count} sensors, {total_size} bytes total")
-
-            batch_data = await reader.readexactly(total_size)
-            if len(batch_data) < total_size:
-                print(f"Incomplete batch data: expected {total_size}, got {len(batch_data)}")
-                break
-
-            offset = 0
-            for i in range(sensor_count):
-                if offset + 64 > len(batch_data):
-                    print(f"Not enough data for sensor header at offset {offset}")
-                    break
-                    
-                sensor_id_bytes = batch_data[offset:offset+16]
-                sensor_id = str(uuid.UUID(bytes=sensor_id_bytes))
-                
-                sensor_type = batch_data[offset+16:offset+48].decode().rstrip('\x00')
-                
-                frame, data_length = struct.unpack('QI', batch_data[offset+48:offset+60])
-                
-                width, height = struct.unpack('II', batch_data[offset+60:offset+68])
-                
-                header_size = 68
-                
-                if offset + header_size + data_length > len(batch_data):
-                    print(f"Not enough data for sensor data at offset {offset}, expected {data_length} bytes")
-                    break
-
-                sensor_data = batch_data[offset+header_size:offset+header_size+data_length]
-                
-                offset += header_size + data_length
-                
-                if sensor_type == 'sensor.camera.rgb':
-                    print(f"Received data from {sensor_id} ({sensor_type}) - Frame: {frame}, Size: {data_length} bytes, Dimensions: {width}x{height}")
-                    if sensor_id not in windows:
-                        CAMERA_RGB(sensor_id, width, height)
-                    windows[sensor_id].display(sensor_data)
-                    
-                elif sensor_type == 'sensor.lidar.ray_cast':
-                    print(f"Received data from {sensor_id} ({sensor_type}) - Frame: {frame}, Size: {data_length} bytes")
-                    if sensor_id not in windows:
-                        LIDAR_RAY_CAST(sensor_id)
-                    windows[sensor_id].display(sensor_data)
-                    
-                else:
-                    print(f"Received data from {sensor_id} ({sensor_type}) - Frame: {frame}, Size: {data_length} bytes")
-
-    except asyncio.IncompleteReadError:
-        print("Connection closed")
-    except struct.error as e:
-        print(f"Struct unpacking error: {e}")
-        print(f"Offset: {offset if 'offset' in locals() else 'N/A'}")
-        print(f"Batch data length: {len(batch_data) if 'batch_data' in locals() else 'N/A'}")
     except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error in handle_data: {e}")
     finally:
         writer.close()
         await writer.wait_closed()
 
 async def main():
+    
+    client = open_carla()
+
+    if client:
+        print("Connected to CARLA!")
+    else:
+        print("Failed to connect to CARLA.")
+        return
+  
+    world = client.get_world()
+    for sensor_cfg in config['sensors']:
+        try:
+            sensor = CARLASensor(sensor_cfg, world)
+            print(f"Spawned sensor: {str(sensor.id)}")
+        except Exception as e:
+            print(f"Error spawning sensor: {e}")
+
     server = await asyncio.start_server(handle_data, config['host'], config['port'])
     addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
     print(f'Serving on {addrs}')
@@ -247,21 +186,13 @@ async def main():
     server_task = asyncio.create_task(server.serve_forever())
     
     try:
-        last_update = time.time()
         while not stop_event.is_set():
-            # Update visualizations at ~60 FPS
-            current_time = time.time()
-            if current_time - last_update > 1.0/60.0:  # ~60 FPS
-                update_visualizations()
-                last_update = current_time
-            
-            await asyncio.sleep(0.001)  # Small sleep to prevent high CPU usage
+            await asyncio.sleep(0.1)
     except KeyboardInterrupt:
         print("\nReceived interrupt signal")
     finally:
-        # Close all windows
-        for win in list(windows.values()):
-            win.destroy()
+        for sensor in sensors.values():
+            sensor.sensor.destroy()
 
         print("Shutting down server...")
         server_task.cancel()
